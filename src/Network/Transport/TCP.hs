@@ -136,6 +136,8 @@ import Data.Accessor (Accessor, accessor, (^.), (^=), (^:))
 import qualified Data.Accessor.Container as DAC (mapMaybe)
 import Data.Foldable (forM_, mapM_)
 
+import Hypervisor.Debug
+
 -- $design
 --
 -- [Goals]
@@ -1498,6 +1500,7 @@ socketToEndPoint (EndPointAddress ourAddress) theirAddress reuseAddr noDelay tim
         mapIOException failed $ N.setSocketOption sock N.ReuseAddr 1
       when noDelay $
         mapIOException failed $ N.setSocketOption sock N.NoDelay 1
+
       mapIOException invalidAddress $
         timeoutMaybe timeout timeoutError $
           N.connect sock (N.addrAddress addr)

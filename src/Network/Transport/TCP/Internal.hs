@@ -26,7 +26,7 @@ import qualified Network.Socket as N
   , getAddrInfo
   , defaultHints
   , socket
-  , bindSocket
+  , bind  -- as bindSocket
   , listen
   , addrFamily
   , addrAddress
@@ -88,7 +88,7 @@ forkServer host port backlog reuseAddr terminationHandler requestHandler = do
     bracketOnError (N.socket (N.addrFamily addr) N.Stream N.defaultProtocol)
                    tryCloseSocket $ \sock -> do
       when reuseAddr $ N.setSocketOption sock N.ReuseAddr 1
-      N.bindSocket sock (N.addrAddress addr)
+      N.bind sock (N.addrAddress addr)
       N.listen sock backlog
       -- We start listening for incoming requests in a separate thread. When
       -- that thread is killed, we close the server socket and the termination
