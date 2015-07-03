@@ -75,7 +75,7 @@ import qualified Network.Socket as N
   , SocketType(Stream)
   , defaultProtocol
   , setSocketOption
-  , SocketOption(ReuseAddr, NoDelay)
+  , SocketOption(ReuseAddr, NoDelay, UserTimeout)
   , connect
   , sOMAXCONN
   , AddrInfo
@@ -87,7 +87,14 @@ import Network.Transport.TCP.Mock.Socket.ByteString (sendMany)
 import Network.Socket.ByteString (sendMany)
 #endif
 
-import Control.Concurrent (forkIO, ThreadId, killThread, myThreadId)
+import Control.Concurrent
+  ( forkIO
+  , ThreadId
+  , killThread
+  , myThreadId
+  , threadDelay
+  , throwTo
+  )
 import Control.Concurrent.Chan (Chan, newChan, readChan, writeChan)
 import Control.Concurrent.MVar
   ( MVar
@@ -101,7 +108,7 @@ import Control.Concurrent.MVar
   )
 import Control.Category ((>>>))
 import Control.Applicative ((<$>))
-import Control.Monad (when, unless, join)
+import Control.Monad (when, unless, join, mplus, (<=<))
 import Control.Exception
   ( IOException
   , SomeException
@@ -111,10 +118,14 @@ import Control.Exception
   , throwIO
   , try
   , bracketOnError
+  , bracket
   , fromException
+  , finally
   , catch
+  , bracket
+  , mask_
   )
-import Data.IORef (IORef, newIORef, writeIORef, readIORef)
+import Data.IORef (IORef, newIORef, writeIORef, readIORef, writeIORef)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS (concat)
 import qualified Data.ByteString.Char8 as BSC (pack, unpack)
@@ -132,6 +143,7 @@ import qualified Data.Set as Set
   )
 import Data.Map (Map)
 import qualified Data.Map as Map (empty)
+import Data.Traversable (traverse)
 import Data.Accessor (Accessor, accessor, (^.), (^=), (^:))
 import qualified Data.Accessor.Container as DAC (mapMaybe)
 import Data.Foldable (forM_, mapM_)
@@ -454,6 +466,14 @@ data TCPParameters = TCPParameters {
     -- | Should we set TCP_NODELAY on connection sockets?
     -- Defaults to True.
   , tcpNoDelay :: Bool
+    -- | Value of TCP_USER_TIMEOUT in milliseconds
+  , tcpUserTimeout :: Maybe Int
+    -- | A connect timeout for all 'connect' calls of the transport
+    -- in microseconds
+    --
+    -- This can be overriden for each connect call with
+    -- 'ConnectHints'.'connectTimeout'.
+  , transportConnectTimeout :: Maybe Int
   }
 
 -- | Internal functionality we expose for unit testing
@@ -541,6 +561,8 @@ defaultTCPParameters = TCPParameters {
   , tcpReuseServerAddr = True
   , tcpReuseClientAddr = True
   , tcpNoDelay         = False
+  , tcpUserTimeout     = Nothing
+  , transportConnectTimeout = Nothing
   }
 
 --------------------------------------------------------------------------------
@@ -609,26 +631,25 @@ apiConnect params ourEndPoint theirAddress _reliability hints =
 -- | Close a connection
 apiClose :: EndPointPair -> LightweightConnectionId -> IORef Bool -> IO ()
 apiClose (ourEndPoint, theirEndPoint) connId connAlive =
-  void . tryIO . asyncWhenCancelled return $ do
-    mAct <- modifyMVar (remoteState theirEndPoint) $ \st -> case st of
-      RemoteEndPointValid vst -> do
-        alive <- readIORef connAlive
-        if alive
-          then do
-            writeIORef connAlive False
-            act <- schedule theirEndPoint $
-              sendOn vst [encodeInt32 CloseConnection, encodeInt32 connId]
-            return ( RemoteEndPointValid
-                   . (remoteOutgoing ^: (\x -> x - 1))
-                   $ vst
-                   , Just act
-                   )
-          else
-            return (RemoteEndPointValid vst, Nothing)
-      _ ->
-        return (st, Nothing)
-    forM_ mAct $ runScheduledAction (ourEndPoint, theirEndPoint)
-    closeIfUnused (ourEndPoint, theirEndPoint)
+  void . tryIO . asyncWhenCancelled return $ finally
+    (withScheduledAction ourEndPoint $ \sched -> do
+      modifyMVar_ (remoteState theirEndPoint) $ \st -> case st of
+        RemoteEndPointValid vst -> do
+          alive <- readIORef connAlive
+          if alive
+            then do
+              writeIORef connAlive False
+              sched theirEndPoint $
+                sendOn vst [encodeInt32 CloseConnection, encodeInt32 connId]
+              return ( RemoteEndPointValid
+                     . (remoteOutgoing ^: (\x -> x - 1))
+                     $ vst
+                     )
+            else
+              return (RemoteEndPointValid vst)
+        _ ->
+          return st)
+    (closeIfUnused (ourEndPoint, theirEndPoint))
 
 
 -- | Send data across a connection
@@ -639,8 +660,8 @@ apiSend :: EndPointPair             -- ^ Local and remote endpoint
         -> IO (Either (TransportError SendErrorCode) ())
 apiSend (ourEndPoint, theirEndPoint) connId connAlive payload =
     -- We don't need the overhead of asyncWhenCancelled here
-    try . mapIOException sendFailed $ do
-      act <- withMVar (remoteState theirEndPoint) $ \st -> case st of
+    try . mapIOException sendFailed $ withScheduledAction ourEndPoint $ \sched -> do
+      withMVar (remoteState theirEndPoint) $ \st -> case st of
         RemoteEndPointInvalid _ ->
           relyViolation (ourEndPoint, theirEndPoint) "apiSend"
         RemoteEndPointInit _ _ _ ->
@@ -648,7 +669,7 @@ apiSend (ourEndPoint, theirEndPoint) connId connAlive payload =
         RemoteEndPointValid vst -> do
           alive <- readIORef connAlive
           if alive
-            then schedule theirEndPoint $
+            then sched theirEndPoint $
               sendOn vst (encodeInt32 connId : prependLength payload)
             else throwIO $ TransportError SendClosed "Connection closed"
         RemoteEndPointClosing _ _ -> do
@@ -666,7 +687,6 @@ apiSend (ourEndPoint, theirEndPoint) connId connAlive payload =
           if alive
             then throwIO $ TransportError SendFailed (show err)
             else throwIO $ TransportError SendClosed "Connection closed"
-      runScheduledAction (ourEndPoint, theirEndPoint) act
   where
     sendFailed = TransportError SendFailed . show
 
@@ -692,33 +712,32 @@ apiCloseEndPoint transport evs ourEndPoint =
   where
     -- Close the remote socket and return the set of all incoming connections
     tryCloseRemoteSocket :: RemoteEndPoint -> IO ()
-    tryCloseRemoteSocket theirEndPoint = do
+    tryCloseRemoteSocket theirEndPoint = withScheduledAction ourEndPoint $ \sched -> do
       -- We make an attempt to close the connection nicely
       -- (by sending a CloseSocket first)
       let closed = RemoteEndPointFailed . userError $ "apiCloseEndPoint"
-      mAct <- modifyMVar (remoteState theirEndPoint) $ \st ->
+      modifyMVar_ (remoteState theirEndPoint) $ \st ->
         case st of
           RemoteEndPointInvalid _ ->
-            return (st, Nothing)
+            return st
           RemoteEndPointInit resolved _ _ -> do
             putMVar resolved ()
-            return (closed, Nothing)
+            return closed
           RemoteEndPointValid vst -> do
-            act <- schedule theirEndPoint $ do
+            sched theirEndPoint $ do
               tryIO $ sendOn vst [ encodeInt32 CloseSocket
                                  , encodeInt32 (vst ^. remoteMaxIncoming)
                                  ]
               tryCloseSocket (remoteSocket vst)
-            return (closed, Just act)
+            return closed
           RemoteEndPointClosing resolved vst -> do
             putMVar resolved ()
-            act <- schedule theirEndPoint $ tryCloseSocket (remoteSocket vst)
-            return (closed, Just act)
+            sched theirEndPoint $ tryCloseSocket (remoteSocket vst)
+            return closed
           RemoteEndPointClosed ->
-            return (st, Nothing)
+            return st
           RemoteEndPointFailed err ->
-            return (RemoteEndPointFailed err, Nothing)
-      forM_ mAct $ runScheduledAction (ourEndPoint, theirEndPoint)
+            return (RemoteEndPointFailed err)
 
 
 --------------------------------------------------------------------------------
@@ -740,6 +759,8 @@ handleConnectionRequest :: TCPTransport -> N.Socket -> IO ()
 handleConnectionRequest transport sock = handle handleException $ do
     when (tcpNoDelay $ transportParams transport) $
       N.setSocketOption sock N.NoDelay 1
+    forM_ (tcpUserTimeout $ transportParams transport) $
+      N.setSocketOption sock N.UserTimeout
     ourEndPointId <- recvInt32 sock
     theirAddress  <- EndPointAddress . BS.concat <$> recvWithLength sock
     let ourAddress = encodeEndPointAddress (transportHost transport)
@@ -763,7 +784,7 @@ handleConnectionRequest transport sock = handle handleException $ do
       mEndPoint <- handle ((>> return Nothing) . handleException) $ do
         resetIfBroken ourEndPoint theirAddress
         (theirEndPoint, isNew) <-
-          findRemoteEndPoint ourEndPoint theirAddress RequestedByThem
+          findRemoteEndPoint ourEndPoint theirAddress RequestedByThem Nothing
 
         if not isNew
           then do
@@ -1047,17 +1068,25 @@ createConnectionTo :: TCPParameters
                     -> EndPointAddress
                     -> ConnectHints
                     -> IO (RemoteEndPoint, LightweightConnectionId)
-createConnectionTo params ourEndPoint theirAddress hints = go
+createConnectionTo params ourEndPoint theirAddress hints = do
+    -- @timer@ is an IO action that completes when the timeout expires.
+    timer <- case connectTimeout hints `mplus` transportConnectTimeout params of
+              Just t -> do
+                mv <- newEmptyMVar
+                _ <- forkIO $ threadDelay t >> putMVar mv ()
+                return $ Just $ readMVar mv
+              _      -> return Nothing
+    go timer
   where
-    go = do
+    go timer = do
       (theirEndPoint, isNew) <- mapIOException connectFailed $
-        findRemoteEndPoint ourEndPoint theirAddress RequestedByUs
+        findRemoteEndPoint ourEndPoint theirAddress RequestedByUs timer
 
       if isNew
         then do
-          forkIO . handle absorbAllExceptions $
+          handle absorbAllExceptions $
             setupRemoteEndPoint params (ourEndPoint, theirEndPoint) hints
-          go
+          go timer
         else do
           -- 'findRemoteEndPoint' will have increased 'remoteOutgoing'
           mapIOException connectFailed $ do
@@ -1099,7 +1128,9 @@ setupRemoteEndPoint params (ourEndPoint, theirEndPoint) hints = do
                                theirAddress
                                (tcpReuseClientAddr params)
                                (tcpNoDelay params)
-                               (connectTimeout hints)
+                               (tcpUserTimeout params)
+                               (connectTimeout hints
+                                 `mplus` transportConnectTimeout params)
     didAccept <- case result of
       Right (sock, ConnectionRequestAccepted) -> do
         sendLock <- newMVar ()
@@ -1132,7 +1163,8 @@ setupRemoteEndPoint params (ourEndPoint, theirEndPoint) hints = do
         resolveInit (ourEndPoint, theirEndPoint) (RemoteEndPointInvalid err)
         return False
 
-    when didAccept $ handleIncomingMessages (ourEndPoint, theirEndPoint)
+    when didAccept $ void $ forkIO $
+      handleIncomingMessages (ourEndPoint, theirEndPoint)
   where
     ourAddress      = localAddress ourEndPoint
     theirAddress    = remoteAddress theirEndPoint
@@ -1209,7 +1241,8 @@ connectToSelf ourEndPoint = do
         LocalEndPointValid _ -> do
           alive <- readIORef connAlive
           if alive
-            then writeChan ourChan (Received connId msg)
+            then seq (foldr seq () msg)
+                   writeChan ourChan (Received connId msg)
             else throwIO $ TransportError SendClosed "Connection closed"
         LocalEndPointClosed ->
           throwIO $ TransportError SendFailed "Endpoint closed"
@@ -1332,13 +1365,15 @@ removeLocalEndPoint transport ourEndPoint =
       return TransportClosed
 
 -- | Find a remote endpoint. If the remote endpoint does not yet exist we
--- create it in Init state. Returns if the endpoint was new.
+-- create it in Init state. Returns if the endpoint was new, or 'Nothing' if
+-- it times out.
 findRemoteEndPoint
   :: LocalEndPoint
   -> EndPointAddress
   -> RequestedBy
+  -> Maybe (IO ())           -- ^ an action which completes when the time is up
   -> IO (RemoteEndPoint, Bool)
-findRemoteEndPoint ourEndPoint theirAddress findOrigin = go
+findRemoteEndPoint ourEndPoint theirAddress findOrigin mtimer = go
   where
     go = do
       (theirEndPoint, isNew) <- modifyMVar ourState $ \st -> case st of
@@ -1391,14 +1426,14 @@ findRemoteEndPoint ourEndPoint theirAddress findOrigin = go
             RemoteEndPointInit resolved crossed initOrigin ->
               case (findOrigin, initOrigin) of
                 (RequestedByUs, RequestedByUs) ->
-                  readMVar resolved >> go
+                  readMVarTimeout mtimer resolved >> go
                 (RequestedByUs, RequestedByThem) ->
-                  readMVar resolved >> go
+                  readMVarTimeout mtimer resolved >> go
                 (RequestedByThem, RequestedByUs) ->
                   if ourAddress > theirAddress
                     then do
                       -- Wait for the Crossed message
-                      readMVar crossed
+                      readMVarTimeout mtimer crossed
                       return (theirEndPoint, True)
                     else
                       return (theirEndPoint, False)
@@ -1411,7 +1446,7 @@ findRemoteEndPoint ourEndPoint theirAddress findOrigin = go
               -- maintain enough history to be able to tell the difference).
               return (theirEndPoint, False)
             RemoteEndPointClosing resolved _ ->
-              readMVar resolved >> go
+              readMVarTimeout mtimer resolved >> go
             RemoteEndPointClosed ->
               go
             RemoteEndPointFailed err ->
@@ -1419,6 +1454,14 @@ findRemoteEndPoint ourEndPoint theirAddress findOrigin = go
 
     ourState   = localState ourEndPoint
     ourAddress = localAddress ourEndPoint
+
+    -- | Like 'readMVar' but it throws an exception if the timer expires.
+    readMVarTimeout Nothing mv = readMVar mv
+    readMVarTimeout (Just timer) mv = do
+      let connectTimedout = TransportError ConnectTimeout "Timed out"
+      tid <- myThreadId
+      bracket (forkIO $ timer >> throwTo tid connectTimedout) killThread $
+        const $ readMVar mv
 
 -- | Send a payload over a heavyweight connection (thread safe)
 sendOn :: ValidRemoteEndPointState -> [ByteString] -> IO ()
@@ -1474,6 +1517,15 @@ runScheduledAction (ourEndPoint, theirEndPoint) mvar = do
       writeChan (localChannel ourEndPoint) $ ErrorEvent err
       return (RemoteEndPointFailed ex)
 
+-- | Use 'schedule' action 'runScheduled' action in a safe way, it's assumed that
+-- callback is used only once, otherwise guarantees of runScheduledAction are not
+-- respected.
+withScheduledAction :: LocalEndPoint -> ((RemoteEndPoint -> IO a -> IO ()) -> IO ()) -> IO ()
+withScheduledAction ourEndPoint f =
+  bracket (newIORef Nothing)
+          (traverse (\(tp, a) -> runScheduledAction (ourEndPoint, tp) a) <=< readIORef)
+          (\ref -> f (\rp g -> mask_ $ schedule rp g >>= \x -> writeIORef ref (Just (rp,x)) ))
+
 --------------------------------------------------------------------------------
 -- "Stateless" (MVar free) functions                                          --
 --------------------------------------------------------------------------------
@@ -1485,10 +1537,12 @@ socketToEndPoint :: EndPointAddress -- ^ Our address
                  -> EndPointAddress -- ^ Their address
                  -> Bool            -- ^ Use SO_REUSEADDR?
                  -> Bool            -- ^ Use TCP_NODELAY
+                 -> Maybe Int       -- ^ Maybe TCP_USER_TIMEOUT
                  -> Maybe Int       -- ^ Timeout for connect
                  -> IO (Either (TransportError ConnectErrorCode)
                                (N.Socket, ConnectionRequestResponse))
-socketToEndPoint (EndPointAddress ourAddress) theirAddress reuseAddr noDelay timeout =
+socketToEndPoint (EndPointAddress ourAddress) theirAddress reuseAddr noDelay
+                 mUserTimeout timeout =
   try $ do
     (host, port, theirEndPointId) <- case decodeEndPointAddress theirAddress of
       Nothing  -> throwIO (failed . userError $ "Could not parse")
@@ -1500,13 +1554,21 @@ socketToEndPoint (EndPointAddress ourAddress) theirAddress reuseAddr noDelay tim
         mapIOException failed $ N.setSocketOption sock N.ReuseAddr 1
       when noDelay $
         mapIOException failed $ N.setSocketOption sock N.NoDelay 1
+<<<<<<< HEAD
 
       mapIOException invalidAddress $
         timeoutMaybe timeout timeoutError $
+=======
+      forM_ mUserTimeout $
+        mapIOException failed . N.setSocketOption sock N.UserTimeout
+      response <- timeoutMaybe timeout timeoutError $ do
+        mapIOException invalidAddress $
+>>>>>>> 130f6f1a57f0649dac43c2a3a970a9696a8de4bc
           N.connect sock (N.addrAddress addr)
-      response <- mapIOException failed $ do
-        sendMany sock (encodeInt32 theirEndPointId : prependLength [ourAddress])
-        recvInt32 sock
+        mapIOException failed $ do
+          sendMany sock
+                   (encodeInt32 theirEndPointId : prependLength [ourAddress])
+          recvInt32 sock
       case tryToEnum response of
         Nothing -> throwIO (failed . userError $ "Unexpected response")
         Just r  -> return (sock, r)
