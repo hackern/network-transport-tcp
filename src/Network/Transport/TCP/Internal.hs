@@ -26,7 +26,7 @@ import qualified Network.Socket as N
   , getAddrInfo
   , defaultHints
   , socket
-  , bind  -- as bindSocket
+  , bind -- bindSocket
   , listen
   , addrFamily
   , addrAddress
